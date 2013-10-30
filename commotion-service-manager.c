@@ -44,6 +44,7 @@
 #include <serval-crypto.h>
 #include <avahi-common/malloc.h>
 #include <avahi-common/error.h>
+#include <avahi-common/simple-watch.h>
 
 #include "commotion-service-manager.h"
 #include "util.h"
@@ -67,28 +68,28 @@ ServiceInfo *services = NULL;
 
 static struct arguments arguments;
 static int pid_filehandle;
-static AvahiSimplePoll *simple_poll = NULL;
-static AvahiServer *server = NULL;
+AvahiSimplePoll *simple_poll = NULL;
+AvahiServer *server = NULL;
 
-static void resolve_callback(
-    AvahiSServiceResolver *r,
-    AVAHI_GCC_UNUSED AvahiIfIndex interface,
-    AVAHI_GCC_UNUSED AvahiProtocol protocol,
-    AvahiResolverEvent event,
-    const char *name,
-    const char *type,
-    const char *domain,
-    const char *host_name,
-    const AvahiAddress *address,
-    uint16_t port,
-    AvahiStringList *txt,
-    AvahiLookupResultFlags flags,
-    void* userdata);
+// static void resolve_callback(
+//     AvahiSServiceResolver *r,
+//     AVAHI_GCC_UNUSED AvahiIfIndex interface,
+//     AVAHI_GCC_UNUSED AvahiProtocol protocol,
+//     AvahiResolverEvent event,
+//     const char *name,
+//     const char *type,
+//     const char *domain,
+//     const char *host_name,
+//     const AvahiAddress *address,
+//     uint16_t port,
+//     AvahiStringList *txt,
+//     AvahiLookupResultFlags flags,
+//     void* userdata);
 
 /**
  * Check if a service name is in the current list of local services
  */
-static ServiceInfo *find_service(const char *name) {
+ServiceInfo *find_service(const char *name) {
   ServiceInfo *i;
   
   for (i = services; i; i = i->info_next)
@@ -107,14 +108,14 @@ static ServiceInfo *find_service(const char *name) {
  * @param domain domain service is advertised on (e.g. mesh.local)
  * @return ServiceInfo struct representing the service that was added
  */
-static ServiceInfo *add_service(AvahiIfIndex interface, AvahiProtocol protocol, const char *name, const char *type, const char *domain) {
+ServiceInfo *add_service(AvahiIfIndex interface, AvahiProtocol protocol, const char *name, const char *type, const char *domain) {
     ServiceInfo *i;
 
     i = avahi_new0(ServiceInfo, 1);
 
     if (!(i->resolver = avahi_s_service_resolver_new(server, interface, protocol, name, type, domain, AVAHI_PROTO_UNSPEC, 0, resolve_callback, i))) {
         avahi_free(i);
-        INFO("Failed to resolve service '%s' of type '%s' in domain '%s': %s", name, type, domain, avahi_strerror(avahi_server_errno(server)));
+        INFO("Failed to create resolver for service '%s' of type '%s' in domain '%s': %s", name, type, domain, avahi_strerror(avahi_server_errno(server)));
         return NULL;
     }
     i->interface = interface;
@@ -137,7 +138,7 @@ static ServiceInfo *add_service(AvahiIfIndex interface, AvahiProtocol protocol, 
  * @note If compiled for OpenWRT, the Avahi service file for the local service is removed
  * @note If compiled with UCI support, service is also removed from UCI list
  */
-static void remove_service(AvahiTimeout *t, void *userdata) {
+void remove_service(AvahiTimeout *t, void *userdata) {
     assert(userdata);
     ServiceInfo *i = (ServiceInfo*)userdata;
 
@@ -187,7 +188,7 @@ static void remove_service(AvahiTimeout *t, void *userdata) {
  * @param f File to output to
  * @param service the service to print
  */
-static void print_service(FILE *f, ServiceInfo *service) {
+void print_service(FILE *f, ServiceInfo *service) {
     char a[AVAHI_ADDRESS_STR_MAX];
     char interface_string[IF_NAMESIZE];
     const char *protocol_string;
@@ -238,9 +239,9 @@ void sig_handler(int signal) {
  * @param i the service to verify (includes signature and fingerprint txt fields)
  * @returns 0 if the signature is valid, 1 if it is invalid
  */
-static int verify_announcement(ServiceInfo *i) {
-  char type_template[] = "<txt-record>type=%s</txt-record>";
-  char template[] = "<type>%s</type>\n\
+int verify_announcement(ServiceInfo *i) {
+  const char type_template[] = "<txt-record>type=%s</txt-record>";
+  const char template[] = "<type>%s</type>\n\
 <domain-name>%s</domain-name>\n\
 <port>%s</port>\n\
 <txt-record>application=%s</txt-record>\n\
@@ -313,7 +314,7 @@ static int verify_announcement(ServiceInfo *i) {
   CHECK_MEM(asprintf(&msg,template,i->type,i->domain,portstr,app,ttl,ipaddr,types_list_len ? type_str : "",icon,desc,expr) != -1);
   
   /* Is the signature valid? 0=yes, 1=no */
-  verdict = verify(sid,strlen(sid),msg,strlen(msg),sig,strlen(sig));
+  verdict = serval_verify(sid,strlen(sid),msg,strlen(msg),sig,strlen(sig));
   
 error:
   if (type)
@@ -333,7 +334,7 @@ error:
  * @note if txt fields fail verification, the service is removed from
  *       the local list
  */
-static void resolve_callback(
+void resolve_callback(
     AvahiSServiceResolver *r,
     AVAHI_GCC_UNUSED AvahiIfIndex interface,
     AVAHI_GCC_UNUSED AvahiProtocol protocol,
@@ -404,14 +405,14 @@ static void resolve_callback(
 	    
 	    /* Validate fingerprint field */
 	    avahi_string_list_get_pair(avahi_string_list_find(txt,"fingerprint"),NULL,&val,&val_size);
-	    if (val_size != FINGERPRINT_LEN && !isHex(val,val_size)) {
+	    if (val_size != FINGERPRINT_LEN || !isHex(val,val_size)) {
 	      WARN("(Resolver) Invalid fingerprint: %s -> %s",name,val);
 	      break;
 	    }
 	    
 	    /* Validate (but not verify) signature field */
 	    avahi_string_list_get_pair(avahi_string_list_find(txt,"signature"),NULL,&val,&val_size);
-	    if (val_size != SIG_LENGTH && !isHex(val,val_size)) {
+	    if (val_size != SIG_LENGTH || !isHex(val,val_size)) {
 	      WARN("(Resolver) Invalid signature: %s -> %s",name,val);
 	      break;
 	    }
@@ -464,7 +465,7 @@ static void resolve_callback(
  * Handler for Avahi service browser events. Called whenever a new 
  * services becomes available on the LAN or is removed from the LAN
  */
-static void browse_service_callback(
+void browse_service_callback(
     AvahiSServiceBrowser *b,
     AvahiIfIndex interface,
     AvahiProtocol protocol,
@@ -546,6 +547,11 @@ void browse_type_callback(
                                                                 type, 
                                                                 domain);
                 avahi_simple_poll_quit(simple_poll);
+            } else {
+                DEBUG("Service Browser: Successfully created a service " 
+                                "browser for type (%s) in domain (%s)", 
+                                                                type, 
+                                                                domain);
             }
             break;
         case AVAHI_BROWSER_CACHE_EXHAUSTED:
